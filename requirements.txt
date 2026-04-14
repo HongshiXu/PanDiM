@@ -1,5 +1,5 @@
--e ./causal-conv1d
--e ./mamba
+causal-conv1d
+mamba-ssm
 beartype==0.21.0
 einops==0.8.1
 h5py==3.10.0

@@ -9,10 +9,11 @@ import torchvision as tv
 import einops
 import matplotlib.pyplot as plt
 import argparse
+from itertools import chain
 
 from diffusion.diffusion_ddpm_pan import GaussianDiffusion
 from diffusion.diffusion_ddpm_pan import make_beta_schedule
-from models.PanVIM import PanDiM
+from models.PanDiM import PanDiM
 from data.PanDataset import PanDataset
 from data.H5Dataset import H5Dataset
 from utils.optim_utils import EmaUpdater
@@ -21,8 +22,84 @@ from utils.logger import TensorboardLogger
 from utils.misc import grad_clip, model_load
 from utils.metrics import AnalysisMetrics
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def _safe_log_scalar(logger, tag, value, step):
+    if value is None:
+        return
+    if isinstance(value, bool):
+        return
+    if isinstance(value, (int, float)):
+        logger.log_scalar(tag, float(value), step)
+
+
+def _mean_attr(modules, attr_name):
+    values = []
+    for module in modules:
+        if hasattr(module, attr_name):
+            value = getattr(module, attr_name)
+            if isinstance(value, (int, float)):
+                values.append(float(value))
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _param_grad_norm(module, attr_path):
+    target = module
+    for part in attr_path.split('.'):
+        target = getattr(target, part, None)
+        if target is None:
+            return None
+    grad = getattr(target, 'grad', None)
+    if grad is None:
+        return None
+    return float(grad.detach().norm().item())
+
+
+def _mean_grad_norm(modules, attr_path):
+    values = []
+    for module in modules:
+        value = _param_grad_norm(module, attr_path)
+        if value is not None:
+            values.append(value)
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def _collect_posterior_diagnostics(model):
+    mapper_modules = [m for m in model.modules() if m.__class__.__name__ in ('PosteriorControlMapper', 'DetailGuidedAffineModulator')]
+    block_modules = [m for m in model.modules() if m.__class__.__name__ == 'CondDiffusionMambaBlock']
+    return {
+        'posterior/z_deg_norm_avg': _mean_attr(mapper_modules, '_last_z_deg_norm'),
+        'posterior/d_map_mean_avg': _mean_attr(mapper_modules, '_last_d_map_mean'),
+        'posterior/phys_energy_mean_avg': _mean_attr(mapper_modules, '_last_phys_energy'),
+        'posterior/scale_abs_mean_avg': _mean_attr(mapper_modules, '_last_scale_abs_mean'),
+        'posterior/shift_abs_mean_avg': _mean_attr(mapper_modules, '_last_shift_abs_mean'),
+        'posterior/delta_gamma_abs_avg': _mean_attr(mapper_modules, '_last_delta_gamma_abs'),
+        'posterior/delta_ssm_abs_avg': _mean_attr(mapper_modules, '_last_delta_ssm_abs'),
+        'hyper/in_scale_avg': _mean_attr(mapper_modules, '_last_hyper_in_scale'),
+        'hyper/out_scale_avg': _mean_attr(mapper_modules, '_last_hyper_out_scale'),
+        'hyper/delta_in_ratio_avg': _mean_attr(block_modules, '_last_delta_in_ratio'),
+        'hyper/delta_out_ratio_avg': _mean_attr(block_modules, '_last_delta_out_ratio'),
+        'hyper/delta_in_abs_avg': _mean_attr(block_modules, '_last_delta_in_abs'),
+        'hyper/delta_out_abs_avg': _mean_attr(block_modules, '_last_delta_out_abs'),
+        'hyper/base_in_abs_avg': _mean_attr(block_modules, '_last_base_in_abs'),
+        'hyper/base_out_abs_avg': _mean_attr(block_modules, '_last_base_out_abs'),
+        'hyper/gate_mean_avg': _mean_attr(block_modules, '_last_gate_mean'),
+        'hyper/ssm_mean_avg': _mean_attr(block_modules, '_last_ssm_mean'),
+        'grads/gamma_mlp_avg': _mean_grad_norm(mapper_modules, 'gamma_mlp.1.weight'),
+        'grads/hyper_ssm_avg': _mean_grad_norm(mapper_modules, 'hyper_ssm.1.weight'),
+        'grads/hyper_in_left_avg': _mean_grad_norm(mapper_modules, 'hyper_in_left.weight'),
+        'grads/hyper_out_left_avg': _mean_grad_norm(mapper_modules, 'hyper_out_left.weight'),
+        'grads/hyper_in_scale_avg': _mean_grad_norm(mapper_modules, 'hyper_in_scale'),
+        'grads/hyper_out_scale_avg': _mean_grad_norm(mapper_modules, 'hyper_out_scale'),
+        'debug/num_mapper_modules': float(len(mapper_modules)),
+        'debug/num_cond_mamba_blocks': float(len(block_modules)),
+    }
 
 def train(
     train_dataset_folder,
@@ -56,12 +133,16 @@ def train(
         lms_channel=ms_num_channel,
         pan_channel=pan_num_channel,
         time_hidden_ratio=args.time_hidden_ratio,
-        num_dim_layers=args.num_dim_layers,
+        num_dit_layers=args.num_dit_layers,
         num_heads=args.num_heads,
         mlp_ratio=args.mlp_ratio,
-        with_noise_level_emb=args.with_noise_level_emb,
-        self_condition=args.self_condition,
-        neck_type=args.neck_type,
+        use_gated_block=args.use_gated_block,
+        all_gated=args.all_gated,
+        local_type=args.local_type,
+        use_channel_swap=args.use_channel_swap,
+        use_pure_mamba=args.use_pure_mamba,
+        gate_type=args.gate_type,
+        use_cond_mamba=args.use_cond_mamba
     ).to(device)
 
     
@@ -108,7 +189,7 @@ def train(
     opt_d = torch.optim.AdamW(denoise_fn.parameters(), lr=lr_d, weight_decay=args.weight_decay)
 
     scheduler_d = torch.optim.lr_scheduler.MultiStepLR(
-        opt_d, milestones=[40_000, 80_000, 100_000], gamma=0.5
+        opt_d, milestones=[60_000, 80_000, 100_000], gamma=0.5
     )
     schedulers = StepsAll(scheduler_d)
     
@@ -143,7 +224,12 @@ def train(
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, num_workers=4, shuffle=False)
 
     stf_time = time.strftime("%m-%d_%H-%M", time.localtime())
-    comment = f"{dataset_name}_P{patch_size}C{args.inner_channel}L{args.num_dim_layers}H{args.num_heads}B{batch_size}-{args.model_name}"
+    comment = f"{dataset_name}_P{patch_size}C{args.inner_channel}L{args.num_dit_layers}H{args.num_heads}B{batch_size}-{args.model_name}"
+    
+    if args.use_pure_mamba:
+        comment += "_PureMamba"
+    if args.use_cond_mamba:
+        comment += "_CondMamba"
         
     logger = TensorboardLogger(
         place="./runs",
@@ -348,23 +434,28 @@ def train(
                     except Exception as e:
                         logger.print(f"Failed to save periodic backup: {e}")
 
-            # log loss
+            # log loss and posterior / hyper diagnostics
             if iterations % 500 == 0:
-                logger.log_scalar("denoised_loss", diff_loss.item(), iterations)
-                
-                # Fetch auxiliary physics stats from the model
-                dgam_modules = [m for m in diffusion_dp.modules() if m.__class__.__name__ == 'SeedConfidenceAffineModulator']
-                if len(dgam_modules) > 0:
-                    dgam = dgam_modules[-1]
-                    if hasattr(dgam, '_last_alpha_aux'):
-                        logger.log_scalar("physics/alpha_aux", dgam._last_alpha_aux, iterations)
-                    if hasattr(dgam, '_last_scale_abs_mean'):
-                        logger.log_scalar("physics/scale_abs_mean", dgam._last_scale_abs_mean, iterations)
-                    if hasattr(dgam, '_last_phys_energy'):
-                        logger.log_scalar("physics/phys_energy_mean", dgam._last_phys_energy, iterations)
+                _safe_log_scalar(logger, "denoised_loss", diff_loss.item(), iterations)
+
+                diagnostics = _collect_posterior_diagnostics(diffusion_dp)
+                for tag, value in diagnostics.items():
+                    _safe_log_scalar(logger, tag, value, iterations)
+
+                logger.print(
+                    "[diag] "
+                    + f"z_deg={diagnostics.get('posterior/z_deg_norm_avg', None)} | "
+                    + f"d_map={diagnostics.get('posterior/d_map_mean_avg', None)} | "
+                    + f"d_ssm={diagnostics.get('posterior/delta_ssm_abs_avg', None)} | "
+                    + f"din_ratio={diagnostics.get('hyper/delta_in_ratio_avg', None)} | "
+                    + f"dout_ratio={diagnostics.get('hyper/delta_out_ratio_avg', None)} | "
+                    + f"g_hssm={diagnostics.get('grads/hyper_ssm_avg', None)}"
+                )
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Training script for PanDiM")
+    # parser.add_argument('--train_dataset_folder', type=str, required=True, help='Path to the training dataset folder')
+    # parser.add_argument('--valid_dataset_folder', type=str, required=True, help='Path to the validation dataset folder')
     parser.add_argument('--model_name', type=str, default='PanDiM', help='Model name')
     parser.add_argument('--dataset_name', type=str, default='WV3', help='Dataset name')
     parser.add_argument('--ms_num_channel', type=int, default=4, help='Number of multispectral channels')
@@ -388,15 +479,21 @@ def parse_args():
     parser.add_argument('--inner_channel', type=int, default=16, help='Number of inner channels')
     parser.add_argument('--noise_level_channel', type=int, default=128, help='Number of noise level channels')
     parser.add_argument('--time_hidden_ratio', type=int, default=4, help='Time hidden ratio')
-    parser.add_argument('--num_dim_layers', type=int, default=12, help='Number of DiM layers')
+    parser.add_argument('--num_dit_layers', type=int, default=12, help='Number of DIT layers')
     parser.add_argument('--num_heads', type=int, default=16, help='Number of attention heads')
-    parser.add_argument('--mlp_ratio', type=int, default=4, help='MLP ratio in DiM block')
+    parser.add_argument('--mlp_ratio', type=int, default=4, help='MLP ratio in DIT Block')
     parser.add_argument('--with_noise_level_emb', type=bool, default=True, help='Whether to include noise level embedding')
     parser.add_argument('--self_condition', type=bool, default=True, help='Whether to self condition')
     parser.add_argument('--mode', type=str, default='CMYK', help='Path to save the output images')
     parser.add_argument('--use_h5', action='store_true', default=True, help='Use H5 dataset')
+    parser.add_argument('--use_gated_block', action='store_true', default=True, help='Use GatedHybridBlock')
+    parser.add_argument("--all_gated", action="store_true", help="Use GatedHybridBlock in ALL layers (Unified Backbone)")
+    parser.add_argument('--local_type', type=str, default='convnext', choices=['classic', 'arconv', 'resblock', 'local_refine', 'convnext', 'fdconv', 'mkpu'], help='Local branch type in GatedDiMBlock')
+    parser.add_argument("--use_channel_swap", action="store_true", help="Enable Optional Channel Swap in GatedDiMBlock (Inspired by PanMamba)")
     parser.add_argument('--extra_checkpoint_path', type=str, default=None, help='Extra path to save checkpoints')
-    parser.add_argument('--neck_type', type=str, default='hybrid', choices=['hybrid', 'wave', 'pyramid'], help='Condition neck layout for the DiM backbone')
+    parser.add_argument("--use_pure_mamba", action="store_true", help="Enable Pure Mamba Baseline for ablation study")
+    parser.add_argument("--use_cond_mamba", action="store_true", help="Enable Condition-Modulated Mamba (CM-SSM) Block")
+    parser.add_argument('--gate_type', type=str, default='spatial', choices=['spatial', 'consensus', 'skfusion'], help='Gate type for GatedDiMBlock')
     parser.add_argument("--lock_threshold", type=int, default=16000, help="Step threshold to lock ARConv kernels")
     # FDDL (Frequency Decoupled Loss)
     parser.add_argument("--use_fddl", action="store_true", help="Enable Spatial_FDDL physics prior with cosine decay")

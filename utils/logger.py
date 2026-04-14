@@ -60,7 +60,7 @@ class TensorboardLogger:
         file_dir = os.path.join(file_dir, file_logger_name)
         os.makedirs(file_dir, exist_ok=True)
         # Backup core files for version traceability
-        for src_file in ['./models/PanVIM_modules.py', './models/PanVIM.py', './train.py']:
+        for src_file in ['./models/PanDiM_modules.py', './models/PanDiM.py', './train.py']:
             if os.path.exists(src_file):
                 shutil.copyfile(src_file, os.path.join(file_dir, os.path.basename(src_file)))
         self.file_writer = PrintLogger(os.path.join(file_dir, file_logger_name + '.txt'))
